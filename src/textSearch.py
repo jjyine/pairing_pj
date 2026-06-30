@@ -322,9 +322,38 @@ def get_duplicate_groups(cursor):
 
 
 # -----------------------------
-# 중복 (winery_name, ws_name, ws_url) 그룹에 속한 row만
+# ws_name 단독 기준으로 wine 테이블 전체에서 중복되는 ws_name 집합 조회
+# (winery_name, ws_url과 무관하게 같은 ws_name이 2건 이상이면 중복)
+# -----------------------------
+def get_duplicate_ws_names(cursor):
+    cursor.execute("""
+        SELECT ws_name
+        FROM wine
+        WHERE ws_name IS NOT NULL
+          AND ws_name != ''
+        GROUP BY ws_name
+        HAVING COUNT(*) > 1
+    """)
+    return {row[0] for row in cursor.fetchall()}
+
+
+# -----------------------------
+# text_search 값 생성 (전체 업데이트용)
+# ws_name이 있고 단독 중복이 아니면 ws_name 사용
+# ws_name이 없거나 단독 중복이면 winery_name + name 조합 사용
+# -----------------------------
+def build_text_search_unique(ws_name, winery_name, name, duplicate_ws_names):
+    if not is_blank(ws_name) and ws_name not in duplicate_ws_names:
+        return normalize_text(ws_name)
+
+    return build_text_search_force(winery_name, name)
+
+
+# -----------------------------
 # text_search를 winery_name + name 조합으로 강제 업데이트
-# deleted_at IS NULL인 row만 업데이트 대상
+# deleted_at 여부와 상관없이 업데이트 대상
+# all_rows=True면 중복 그룹 여부와 상관없이 전체 row를 업데이트
+# all_rows=False(기본)면 중복 (winery_name, ws_name, ws_url) 그룹에 속한 row만 업데이트
 # -----------------------------
 def save_text_search_force_to_db(
     batch_size=1000,
@@ -334,7 +363,8 @@ def save_text_search_force_to_db(
     dry_run=False,
     test_limit=None,
     min_count=None,
-    max_count=None
+    max_count=None,
+    all_rows=False
 ):
     conn = None
     read_cursor = None
@@ -359,18 +389,30 @@ def save_text_search_force_to_db(
         log_info(
             worker_name,
             f"batch_size={batch_size}, start_id={start_id}, end_id={end_id}, dry_run={dry_run}, "
-            f"test_limit={test_limit}, min_count={min_count}, max_count={max_count}",
+            f"test_limit={test_limit}, min_count={min_count}, max_count={max_count}, all_rows={all_rows}",
             info_filename
         )
 
-        # 중복 그룹 조회는 한 번만 수행 (이전에는 배치마다 반복 실행되어 타임아웃 발생)
-        group_start = time.time()
-        duplicate_groups = get_duplicate_groups(read_cursor)
-        log_info(
-            worker_name,
-            f"[GROUP BY DONE] 중복 그룹 수={len(duplicate_groups)}, time={time.time() - group_start:.2f}초",
-            info_filename
-        )
+        duplicate_groups = {}
+        duplicate_ws_names = set()
+        if all_rows:
+            # ws_name 단독 중복 조회는 한 번만 수행해 메모리에 캐싱
+            group_start = time.time()
+            duplicate_ws_names = get_duplicate_ws_names(read_cursor)
+            log_info(
+                worker_name,
+                f"[WS_NAME GROUP BY DONE] 중복 ws_name 수={len(duplicate_ws_names)}, time={time.time() - group_start:.2f}초",
+                info_filename
+            )
+        else:
+            # 중복 그룹 조회는 한 번만 수행 (이전에는 배치마다 반복 실행되어 타임아웃 발생)
+            group_start = time.time()
+            duplicate_groups = get_duplicate_groups(read_cursor)
+            log_info(
+                worker_name,
+                f"[GROUP BY DONE] 중복 그룹 수={len(duplicate_groups)}, time={time.time() - group_start:.2f}초",
+                info_filename
+            )
 
         last_id = start_id
         total_scanned = 0
@@ -420,31 +462,40 @@ def save_text_search_force_to_db(
 
             build_start = time.time()
 
-            for wine_id, winery_name, ws_name, ws_url, name, deleted_at, text_search_before in rows:
+            for wine_id, winery_name, ws_name, ws_url, name, _deleted_at, text_search_before in rows:
                 total_scanned += 1
                 last_id = wine_id
 
                 # ===== [조회 조건 수정 지점 3] SQL이 아닌 Python 레벨 필터 =====
-                cnt = duplicate_groups.get((winery_name, ws_name, ws_url))
-                if cnt is None:
-                    continue
-                if min_count is not None and cnt < min_count:
-                    continue
-                if max_count is not None and cnt > max_count:
-                    continue
-                if deleted_at is not None:
-                    continue
+                if not all_rows:
+                    cnt = duplicate_groups.get((winery_name, ws_name, ws_url))
+                    if cnt is None:
+                        continue
+                    if min_count is not None and cnt < min_count:
+                        continue
+                    if max_count is not None and cnt > max_count:
+                        continue
                 # ===== 조회 조건 수정 지점 3 끝 =====
 
                 try:
-                    text_search_after = build_text_search_force(winery_name, name)
+                    if all_rows:
+                        text_search_after = build_text_search_unique(ws_name, winery_name, name, duplicate_ws_names)
+                        if is_blank(ws_name):
+                            source = "winery+name(ws_name_blank)"
+                        elif ws_name in duplicate_ws_names:
+                            source = "winery+name(ws_name_dup)"
+                        else:
+                            source = "ws_name"
+                    else:
+                        text_search_after = build_text_search_force(winery_name, name)
+                        source = "winery+name(force)"
                     update_data.append((text_search_after, wine_id, text_search_before))
                     matched_count += 1
 
                     if dry_run:
                         log_info(
                             worker_name,
-                            f"[DRY RUN] id={wine_id} | before={text_search_before!r} | after={text_search_after!r}",
+                            f"[DRY RUN] id={wine_id} | source={source} | before={text_search_before!r} | after={text_search_after!r}",
                             info_filename
                         )
 

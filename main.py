@@ -275,8 +275,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--limit",
         type=int,
-        default=1,
-        help="test 모드에서 처리할 row 수 (기본값: 1)"
+        default=None,
+        help="처리할 row 수 제한. test 모드에서 생략하면 1건, run 모드에서 생략하면 제한 없음(전체 처리)"
     )
     parser.add_argument(
         "--min-count",
@@ -290,6 +290,11 @@ if __name__ == "__main__":
         default=None,
         help="처리할 최대 중복 그룹 크기 (예: 2이면 그룹 크기 <= 2인 그룹만 처리)"
     )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="중복 그룹 여부와 상관없이 전체 row를 업데이트 (min-count/max-count 무시)"
+    )
     args = parser.parse_args()
 
     if args.mode == "test":
@@ -299,9 +304,10 @@ if __name__ == "__main__":
             end_id=None,
             worker_name="force_dry_run",
             dry_run=True,
-            test_limit=args.limit,
+            test_limit=args.limit if args.limit is not None else 1,
             min_count=args.min_count,
-            max_count=args.max_count
+            max_count=args.max_count,
+            all_rows=args.all
         )
     else:
         save_text_search_force_to_db(
@@ -310,7 +316,8 @@ if __name__ == "__main__":
             end_id=None,
             worker_name="force_run",
             dry_run=False,
-            test_limit=None,
+            test_limit=args.limit,
             min_count=args.min_count,
-            max_count=args.max_count
+            max_count=args.max_count,
+            all_rows=args.all
         )
